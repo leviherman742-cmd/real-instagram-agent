@@ -1,0 +1,278 @@
+import os
+import json
+import hashlib
+import hmac
+from typing import Any, Dict, Optional
+
+import requests
+from fastapi import FastAPI, Header, HTTPException, Request, Query
+from fastapi.responses import JSONResponse
+
+app = FastAPI(title="REAL Social to Pipedrive Agent")
+
+# -----------------------------
+# Environment variables
+# -----------------------------
+PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN", "")
+PIPEDRIVE_BASE_URL = os.getenv("PIPEDRIVE_BASE_URL", "https://api.pipedrive.com/api/v2")
+PIPEDRIVE_PERSONS_V1_URL = os.getenv("PIPEDRIVE_PERSONS_V1_URL", "https://api.pipedrive.com/v1/persons")
+PIPEDRIVE_LEADS_V1_URL = os.getenv("PIPEDRIVE_LEADS_V1_URL", "https://api.pipedrive.com/v1/leads")
+PIPEDRIVE_NOTES_V1_URL = os.getenv("PIPEDRIVE_NOTES_V1_URL", "https://api.pipedrive.com/v1/notes")
+
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")
+
+# Optional custom field keys from Pipedrive
+PIPEDRIVE_SOURCE_FIELD_KEY = os.getenv("PIPEDRIVE_SOURCE_FIELD_KEY", "")
+PIPEDRIVE_SOCIAL_HANDLE_FIELD_KEY = os.getenv("PIPEDRIVE_SOCIAL_HANDLE_FIELD_KEY", "")
+PIPEDRIVE_PROFILE_URL_FIELD_KEY = os.getenv("PIPEDRIVE_PROFILE_URL_FIELD_KEY", "")
+
+# LinkedIn note:
+# Standard third-party access to ordinary LinkedIn inbox messages is restricted.
+# This app therefore supports:
+# 1) Instagram Messaging webhooks
+# 2) LinkedIn lead webhook or other approved LinkedIn event source, if available
+# 3) A manual/internal POST endpoint you can connect to Zapier/Make/Relay/etc.
+
+
+def pipedrive_params() -> Dict[str, str]:
+    if not PIPEDRIVE_API_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing PIPEDRIVE_API_TOKEN")
+    return {"api_token": PIPEDRIVE_API_TOKEN}
+
+
+def verify_meta_signature(payload: bytes, signature_256: Optional[str]) -> bool:
+    if not META_APP_SECRET:
+        return True
+    if not signature_256:
+        return False
+    expected = "sha256=" + hmac.new(
+        META_APP_SECRET.encode("utf-8"), payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_256)
+
+
+def safe_name_from_social(display_name: Optional[str], handle: Optional[str]) -> str:
+    if display_name and display_name.strip():
+        return display_name.strip()
+    if handle and handle.strip():
+        return handle.strip().lstrip("@")
+    return "Social Lead"
+
+
+def search_person_by_name(name: str) -> Optional[int]:
+    url = f"{PIPEDRIVE_PERSONS_V1_URL}/search"
+    resp = requests.get(url, params={**pipedrive_params(), "term": name, "exact_match": False}, timeout=20)
+    resp.raise_for_status()
+    data = resp.json().get("data", {})
+    items = data.get("items") or []
+    if not items:
+        return None
+    first = items[0].get("item", {})
+    return first.get("id")
+
+
+def create_person(name: str, source: str, handle: Optional[str] = None, profile_url: Optional[str] = None) -> int:
+    payload: Dict[str, Any] = {"name": name}
+    if PIPEDRIVE_SOURCE_FIELD_KEY:
+        payload[PIPEDRIVE_SOURCE_FIELD_KEY] = source
+    if handle and PIPEDRIVE_SOCIAL_HANDLE_FIELD_KEY:
+        payload[PIPEDRIVE_SOCIAL_HANDLE_FIELD_KEY] = handle
+    if profile_url and PIPEDRIVE_PROFILE_URL_FIELD_KEY:
+        payload[PIPEDRIVE_PROFILE_URL_FIELD_KEY] = profile_url
+
+    resp = requests.post(PIPEDRIVE_PERSONS_V1_URL, params=pipedrive_params(), json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()["data"]["id"]
+
+
+def get_or_create_person(name: str, source: str, handle: Optional[str] = None, profile_url: Optional[str] = None) -> int:
+    existing_id = search_person_by_name(name)
+    if existing_id:
+        return existing_id
+    return create_person(name=name, source=source, handle=handle, profile_url=profile_url)
+
+
+def create_lead(title: str, person_id: int, source: str) -> str:
+    payload: Dict[str, Any] = {
+        "title": title,
+        "person_id": person_id,
+        "source_name": source,
+    }
+    resp = requests.post(PIPEDRIVE_LEADS_V1_URL, params=pipedrive_params(), json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()["data"]["id"]
+
+
+def add_note(content: str, person_id: Optional[int] = None, lead_id: Optional[str] = None) -> int:
+    payload: Dict[str, Any] = {"content": content}
+    if person_id:
+        payload["person_id"] = person_id
+    if lead_id:
+        payload["lead_id"] = lead_id
+    resp = requests.post(PIPEDRIVE_NOTES_V1_URL, params=pipedrive_params(), json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()["data"]["id"]
+
+
+def upsert_social_lead(
+    *,
+    source: str,
+    display_name: Optional[str],
+    handle: Optional[str],
+    profile_url: Optional[str],
+    message_text: str,
+    raw_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    person_name = safe_name_from_social(display_name, handle)
+    person_id = get_or_create_person(
+        name=person_name,
+        source=source,
+        handle=handle,
+        profile_url=profile_url,
+    )
+
+    lead_title = f"{source} inbound - {person_name}"
+    lead_id = create_lead(title=lead_title, person_id=person_id, source=source)
+
+    note_lines = [
+        f"Source: {source}",
+        f"Display Name: {display_name or ''}",
+        f"Handle: {handle or ''}",
+        f"Profile URL: {profile_url or ''}",
+        "",
+        "Inbound message:",
+        message_text,
+        "",
+        "Raw payload:",
+        json.dumps(raw_payload, indent=2),
+    ]
+    note_id = add_note("\n".join(note_lines), person_id=person_id, lead_id=lead_id)
+
+    return {"person_id": person_id, "lead_id": lead_id, "note_id": note_id}
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/webhooks/meta")
+def verify_meta_webhook(
+    hub_mode: str = Query(..., alias="hub.mode"),
+    hub_verify_token: str = Query(..., alias="hub.verify_token"),
+    hub_challenge: str = Query(..., alias="hub.challenge"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
+        return JSONResponse(content=int(hub_challenge))
+    raise HTTPException(status_code=403, detail="Meta webhook verification failed")
+
+
+@app.post("/webhooks/meta")
+async def receive_meta_webhook(
+    request: Request,
+    x_hub_signature_256: Optional[str] = Header(default=None),
+):
+    body = await request.body()
+    if not verify_meta_signature(body, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="Invalid Meta signature")
+
+    payload = await request.json()
+
+    # Expected structure varies by event. This implementation focuses on inbound Instagram messages.
+    for entry in payload.get("entry", []):
+        for messaging in entry.get("messaging", []):
+            message = messaging.get("message", {})
+            sender = messaging.get("sender", {})
+            if not message or sender.get("id") is None:
+                continue
+
+            message_text = message.get("text") or "[non-text message received]"
+            sender_id = str(sender.get("id"))
+            source = "Instagram"
+
+            upsert_social_lead(
+                source=source,
+                display_name=None,
+                handle=f"ig:{sender_id}",
+                profile_url=None,
+                message_text=message_text,
+                raw_payload=payload,
+            )
+
+    return {"received": True}
+
+
+@app.post("/webhooks/linkedin")
+async def receive_linkedin_like_payload(request: Request):
+    """
+    This endpoint is for approved LinkedIn event sources, LinkedIn lead form middleware,
+    or no-code tools like Zapier/Make that can forward data here.
+
+    Expected JSON:
+    {
+      "source": "LinkedIn",
+      "display_name": "Jane Smith",
+      "handle": "janesmith",
+      "profile_url": "https://www.linkedin.com/in/janesmith/",
+      "message_text": "Hi, interested in your PM services"
+    }
+    """
+    payload = await request.json()
+
+    source = payload.get("source", "LinkedIn")
+    display_name = payload.get("display_name")
+    handle = payload.get("handle")
+    profile_url = payload.get("profile_url")
+    message_text = payload.get("message_text") or "[No message text provided]"
+
+    result = upsert_social_lead(
+        source=source,
+        display_name=display_name,
+        handle=handle,
+        profile_url=profile_url,
+        message_text=message_text,
+        raw_payload=payload,
+    )
+    return {"ok": True, **result}
+
+
+@app.post("/ingest/manual")
+async def ingest_manual(request: Request):
+    """
+    General-purpose endpoint for Zapier/Make/n8n/manual posting.
+    Lets you route any social inbox event into Pipedrive.
+    """
+    payload = await request.json()
+    required = ["source", "message_text"]
+    missing = [field for field in required if not payload.get(field)]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
+
+    result = upsert_social_lead(
+        source=payload["source"],
+        display_name=payload.get("display_name"),
+        handle=payload.get("handle"),
+        profile_url=payload.get("profile_url"),
+        message_text=payload["message_text"],
+        raw_payload=payload,
+    )
+    return {"ok": True, **result}
+
+
+# -----------------------------
+# Run locally:
+# uvicorn main:app --reload --port 8000
+# -----------------------------
+# Suggested deployment:
+# - Render
+# - Railway
+# - Fly.io
+# - AWS Lightsail / EC2
+# -----------------------------
+# Minimum setup:
+# 1) Create Pipedrive API token
+# 2) Set environment variables
+# 3) Connect Instagram Professional account via Meta app + webhooks
+# 4) For LinkedIn, use an approved event source or no-code forwarder to /webhooks/linkedin
+# -----------------------------
